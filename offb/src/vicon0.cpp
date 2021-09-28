@@ -1,0 +1,545 @@
+#include "include/movement.h"
+#include "visualization_msgs/Marker.h"
+#include <algorithm>
+#include "include/run_yolo.h"
+#include <std_msgs/Bool.h>
+#include "geometry_msgs/PointStamped.h"
+#include "include/am_traj.hpp"
+#include <random>
+#include <sensor_msgs/Imu.h>
+#include "offb/frame.h"
+using namespace std;
+
+//predefined
+static double gx = 5, gy = 0, gz = 2;
+static double sx = 0, sy = 0;
+//->!!!!!!!NEED SET TO ZEROs WHEN EXPERIMENT, AS VICON DOESN'T EXIST FRAME DIFFERENCE
+//->!!!!!!!REMAIN THE SAME WHEN CONDUCTING EXPERIMENT AT OUTSIDE
+static double r_safe = 1.5 * 0.55;
+static double r_clear = 0.8;
+
+enum flying_step
+{
+    IDLE,
+    TO2Hover,
+    Hover,
+    Move2wp,
+    HoverandSway,
+    Assign,
+    Land,
+    found,
+    Inspect,
+    locate,
+    gotowp1,
+    gotowp2,
+    gotowp3,
+    Heading,
+    Cal_T,
+    maneuver,
+    LAND,
+    END
+};
+
+static flying_step  fly = IDLE;
+static UAVpose uavinfo, uavinfo_1, uavinfo_2, uavinfo_1_f, uavinfo_2_f;
+static Eigen::Vector3d predicted;
+static mavros_msgs::State current_state;
+static visualization_msgs::Marker UAVtrajectory;
+static vector<waypts> waypoints;
+static vector<waypts> referpts;
+static vector<waypts> futurepts;
+static cv::Mat frame;
+static cv::Mat image_dep;
+static visualization_msgs::Marker edge_points;
+static double v, vx, vy, vz;
+static vector<waypts> traj_p, traj_v, traj_a;
+static size_t i = 0;
+static double yaw = atan2(gy-sy,gx-sx);
+
+void state_callback(const mavros_msgs::State::ConstPtr& msg)
+{
+    current_state = *msg;
+}
+
+void position_callback(const geometry_msgs::PoseStamped::ConstPtr& pose)
+{
+    uavinfo.x = pose->pose.position.x + sx;
+    uavinfo.y = pose->pose.position.y + sy;
+    uavinfo.z = pose->pose.position.z;
+    uavinfo.ow = pose->pose.orientation.w;
+    uavinfo.ox = pose->pose.orientation.x;
+    uavinfo.oy = pose->pose.orientation.y;
+    uavinfo.oz = pose->pose.orientation.z;
+}
+
+void imu_callback(const sensor_msgs::Imu::ConstPtr& msg)
+{
+
+}
+
+void position_callback_1(const geometry_msgs::PoseStamped::ConstPtr& pose)
+{
+    //    cout<<"hi"<<endl;
+    uavinfo_1.x = pose->pose.position.x;
+    uavinfo_1.y = pose->pose.position.y;
+    uavinfo_1.z = pose->pose.position.z;
+}
+
+void position_callback_1_f(const geometry_msgs::PoseStamped::ConstPtr& pose)
+{
+    uavinfo_1_f.x = pose->pose.position.x;
+    uavinfo_1_f.y = pose->pose.position.y;
+    uavinfo_1_f.z = pose->pose.position.z;
+}
+
+void position_callback_2(const geometry_msgs::PoseStamped::ConstPtr& pose)
+{
+    uavinfo_2.x = pose->pose.position.x;
+    uavinfo_2.y = pose->pose.position.y;
+    uavinfo_2.z = pose->pose.position.z;
+}
+
+void position_callback_2_f(const geometry_msgs::PoseStamped::ConstPtr& pose)
+{
+    uavinfo_2_f.x = pose->pose.position.x;
+    uavinfo_2_f.y = pose->pose.position.y;
+    uavinfo_2_f.z = pose->pose.position.z;
+
+}
+
+void velocity_callback(const geometry_msgs::TwistStamped::ConstPtr& velocity)
+{
+    vx = velocity->twist.linear.x;
+    vy = velocity->twist.linear.y;
+    vz = velocity->twist.linear.z;
+    v = sqrt(vx*vx+vy*vy+vz*vz);
+}
+
+void rpy_to_Q(double yaw, double &w, double &x, double &y, double &z)
+{
+    w = cos(0) * cos (0) * cos (yaw/2) + sin (0) * sin (0) * sin (yaw/2) ;
+    x = sin(0) * cos (0) * cos (yaw/2) - cos (0) * sin (0) * sin (yaw/2) ;
+    y = cos(0) * sin (0) * cos (yaw/2) + sin (0) * cos (0) * sin (yaw/2) ;
+    z = cos(0) * cos (0) * sin (yaw/2) - sin (0) * sin (0) * cos (yaw/2) ;
+}
+
+bool detect();
+void am_traj_exc(vector<Eigen::Vector3d> detour);//detour will contain current state, the detour waypoint, and the goal state
+Eigen::Vector3d getmidpt(geometry_msgs::PoseStamped futurestate);
+waypts b2w(Eigen::Matrix<double, 3, 1> body_pt)
+{
+    Eigen::Matrix<double, 4, 1> body, world;
+    body(0) = body_pt(0);
+    body(1) = body_pt(1);
+    body(2) = body_pt(2);
+    body(3) = 1;
+    Eigen::Matrix<double, 3, 3> matrix_for_q;
+
+
+    double current_yaw = atan2(vy, vx);
+    vector<waypts> initializer;
+    movement temp(initializer);
+    geometry_msgs::PoseStamped uav_q;
+    temp.rpy2Q(uav_q, current_yaw);
+
+//    Eigen::Quaterniond q2r_matrix(uav_q.pose.orientation.w,
+//                                  uav_q.pose.orientation.x,
+//                                  uav_q.pose.orientation.y,
+//                                  uav_q.pose.orientation.z);
+    Eigen::Quaterniond q2r_matrix(uavinfo.ow, uavinfo.ox, uavinfo.oy, uavinfo.oz);
+
+    matrix_for_q = q2r_matrix.toRotationMatrix();
+
+    Eigen::Matrix<double, 4, 4> body_to_world;
+    body_to_world <<
+        matrix_for_q(0,0), matrix_for_q(0,1), matrix_for_q(0,2), uavinfo.x,
+        matrix_for_q(1,0), matrix_for_q(1,1), matrix_for_q(1,2), uavinfo.y,
+        matrix_for_q(2,0), matrix_for_q(2,1), matrix_for_q(2,2), uavinfo.z,
+        0,0,0,1;
+
+    world = body_to_world * body;
+    waypts result = {world(0),world(1), world(2)};
+    return result;
+}
+
+int main(int argc, char **argv)
+{
+    cout<<"vicon 0"<<endl;
+    ros::init(argc, argv, "vicon0"); //initialize ROS via passing argc argv. the "offb_node" will be the name of your node's name
+    ros::NodeHandle nh;//the node handle to handle the process of the node. it'll as well intialize the node.
+
+    //subscribers
+    ros::Subscriber sub_state = nh.subscribe<mavros_msgs::State>
+                                ("/uav0/mavros/state", 1, state_callback);
+
+
+    ros::Subscriber sub_uavposition = nh.subscribe<geometry_msgs::PoseStamped>
+                                   ("/uav0/mavros/local_position/pose", 1, position_callback);
+
+    ros::Subscriber sub_uav_1 = nh.subscribe<geometry_msgs::PoseStamped>
+                                  ("/uav1/current_state", 1, position_callback_1);
+
+    ros::Subscriber sub_uav_2 = nh.subscribe<geometry_msgs::PoseStamped>
+                                  ("/uav2/current_state", 1, position_callback_2);
+
+    ros::Subscriber sub_uav_1_f = nh.subscribe<geometry_msgs::PoseStamped>
+                                  ("/uav1/future_state", 1, position_callback_1_f);
+
+    ros::Subscriber sub_uav_2_f =nh.subscribe<geometry_msgs::PoseStamped>
+                                  ("/uav2/future_state", 1, position_callback_2_f);
+
+
+    ros::Subscriber sub_velocity = nh.subscribe<geometry_msgs::TwistStamped>
+                                      ("/uav0/mavros/local_position/velocity_local", 1, velocity_callback);
+
+    ros::Subscriber sub_IMU = nh.subscribe<sensor_msgs::Imu>
+                                      ("/uav0/mavros/imu/data", 1, imu_callback);
+
+    //publishers
+    ros::Publisher pub_traj_pts = nh.advertise<geometry_msgs::PoseStamped>
+                                   ("/uav0/mavros/setpoint_position/local", 1);
+
+    ros::Publisher pub_now = nh.advertise<geometry_msgs::PoseStamped>
+                                  ("/uav0/current_state", 1);
+    ros::Publisher pub_future = nh.advertise<geometry_msgs::PoseStamped>
+                                  ("/uav0/future_state", 1);
+
+
+    ros::ServiceClient arming_client = nh.serviceClient<mavros_msgs::CommandBool>
+                                       ("/uav0/mavros/cmd/arming");
+    ros::ServiceClient set_mode_client = nh.serviceClient<mavros_msgs::SetMode>
+                                         ("/uav0/mavros/set_mode");
+
+    geometry_msgs::PoseStamped pose, future_state;
+
+    //the setpoint publishing rate MUST be faster than 2Hz
+    ros::Rate rate(20.0);
+
+    // wait for FCU connection
+    while(ros::ok() && !current_state.connected)
+    {
+        ros::spinOnce();
+        rate.sleep();
+    }
+
+    //mode setting
+    mavros_msgs::SetMode offb_set_mode;
+    offb_set_mode.request.custom_mode = "OFFBOARD";
+
+    mavros_msgs::CommandBool arm_cmd;
+    arm_cmd.request.value = true;
+
+    frame_d F = {sx, sy};
+
+    double last_request = ros::Time::now().toSec();
+    waypts takeoff ={sx,sy,2};
+    waypts lsp = {sx,sy,0}, lep;
+    vector<waypts> initializer;
+    movement move(initializer);
+
+    //State Machines~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    while(ros::ok())
+    {
+        //preparation~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if(fly == IDLE)
+        {
+            if( current_state.mode != "OFFBOARD" && (ros::Time::now().toSec() - last_request > ros::Duration(4.0).toSec()))
+            {
+                if( set_mode_client.call(offb_set_mode) && offb_set_mode.response.mode_sent)
+                {
+                    ROS_INFO("Offboard enabled");
+                }
+                last_request = ros::Time::now().toSec();
+            }
+            else
+            {
+                if( !current_state.armed && (ros::Time::now().toSec() - last_request > ros::Duration(4.0).toSec()))
+                {
+                    if( arming_client.call(arm_cmd) && arm_cmd.response.success)
+                    {
+                        ROS_INFO("Vehicle armed");
+                        fly = TO2Hover;
+                        lep = takeoff;
+                    }
+                    last_request = ros::Time::now().toSec();
+                }
+            }
+        }
+
+        //takeoff~~~~~~~~~~~~~~~~~~~~~~~
+        if(fly == TO2Hover && (ros::Time::now().toSec() - last_request > ros::Duration(4.0).toSec()))
+        {
+            move.justmove(uavinfo, pose, last_request, ros::Time::now(),lsp, lep);
+            if(move.switchflymode_ == true)
+            {
+                last_request = ros::Time::now().toSec();
+                fly = Move2wp;
+                lsp = takeoff;
+                lep = {gx,gy,gz};
+            }
+        }
+
+        //move~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if(fly == Move2wp && (ros::Time::now().toSec() - last_request > ros::Duration(4.0).toSec()))
+        {
+            cout<<"hi I now calculate for stright line"<<endl;
+            vector<Eigen::Vector3d> detour;
+            Eigen::Vector3d now(uavinfo.x, uavinfo.y, uavinfo.z);
+            Eigen::Vector3d mid( (uavinfo.x + gx)/2,
+                                 (uavinfo.y + gy)/2,
+                                 (uavinfo.z + gz)/2);
+            Eigen::Vector3d goal(gx,gy,gz);
+            detour.push_back(now);
+            detour.push_back(mid);
+            detour.push_back(goal);
+            am_traj_exc(detour);
+            fly = maneuver;
+        }
+
+        if(fly == Cal_T)
+        {
+            vector<Eigen::Vector3d> detour;
+            Eigen::Vector3d now(uavinfo.x, uavinfo.y, uavinfo.z);//traj_p[i].x, traj_p[i].y, traj_p[i].z;
+            Eigen::Vector3d goal(gx,gy,gz), mid = getmidpt(future_state);
+            detour.push_back(now);
+            detour.push_back(mid);
+            detour.push_back(goal);
+            am_traj_exc(detour);
+            fly = maneuver;
+            i = 0;
+        }
+
+        if(fly == maneuver)
+        {
+            predicted = move.futurestate(traj_p, i);
+            future_state.pose.position.x = predicted(0);
+            future_state.pose.position.y = predicted(1);
+            future_state.pose.position.z = predicted(2);
+
+            pose.pose.position.x=traj_p[i].x;
+            pose.pose.position.y=traj_p[i].y;
+            pose.pose.position.z=traj_p[i].z;
+
+            yaw = atan2(traj_v[i].y, traj_v[i].x);
+
+            if(i < traj_p.size() - 1)
+                i++;
+            else
+            {
+                fly = Hover;
+                last_request = ros::Time::now().toSec();
+            }
+
+
+            if(detect())
+            {
+                cout<<"uav0 says gonna hit"<<endl;
+                fly = Cal_T;
+            }
+
+        }
+
+        if(fly == Hover)
+        {
+            move.hover(pose, lep);
+            if(ros::Time::now().toSec() - last_request > ros::Duration(5.0).toSec())
+                fly = LAND;
+        }
+
+        if(fly == LAND)
+        {
+            waypts hi2, hi1;
+            hi2 = {uavinfo.x, uavinfo.y, 2};
+            hi1 = {uavinfo.x, uavinfo.y, 0};
+            move.justmove(uavinfo, pose, last_request, ros::Time::now(), hi2, hi1);
+            if(move.switchflymode_)
+                fly = END;
+        }
+
+
+        if(fly == END)
+        {
+            pose.pose.position.z = pose.pose.position.z - 0.02;
+
+            if(pose.pose.position.z < 0.05)
+            {
+                arm_cmd.request.value = false;
+                if( arming_client.call(arm_cmd) &&
+                            arm_cmd.response.success )
+                {
+                    cout << "UAV about to touch ground" << endl;
+                    cout << "Touched and end...."<< endl;
+                    return 0;//break the control UAV will land automatically
+                }
+             }
+        }
+
+        if(fly == TO2Hover || fly == maneuver || fly == Hover)
+        {
+            pose.pose.position.x = pose.pose.position.x - F.x;
+            pose.pose.position.y = pose.pose.position.y - F.y;
+        }
+
+        rpy_to_Q(yaw,
+                 pose.pose.orientation.w,
+                 pose.pose.orientation.x,
+                 pose.pose.orientation.y,
+                 pose.pose.orientation.z);
+
+
+//        future_state.pose.position.x = future_state.pose.position.x - F.x;
+//        future_state.pose.position.y = future_state.pose.position.y - F.y;
+//        predicted(0) = future_state.pose.position.x;
+//        predicted(1) = future_state.pose.position.y;
+
+        geometry_msgs::PoseStamped currentuavinfo;
+        currentuavinfo.pose.position.x = uavinfo.x;
+        currentuavinfo.pose.position.y = uavinfo.y;
+        currentuavinfo.pose.position.z = uavinfo.z;
+
+        pub_now.publish(currentuavinfo);
+        pub_future.publish(future_state);
+        pub_traj_pts.publish(pose);
+        ros::spinOnce();
+        rate.sleep();
+    }
+
+    return 0;
+}
+
+bool detect()
+{
+    double d01 = sqrt( pow( (predicted(0) - uavinfo_1.x), 2 )
+                       + pow( (predicted(1) - uavinfo_1.y), 2 )
+                       + pow( (predicted(2) - uavinfo_1.z), 2 ) );
+    double d02 = sqrt( pow( (predicted(0) - uavinfo_2.x), 2 )
+                       + pow( (predicted(1) - uavinfo_2.y), 2 )
+                       + pow( (predicted(2) - uavinfo_2.z), 2 ) );
+    double d01f = sqrt( pow( (predicted(0) - uavinfo_1_f.x), 2 )
+                       + pow( (predicted(1) - uavinfo_1_f.y), 2 )
+                       + pow( (predicted(2) - uavinfo_1_f.z), 2 ) );
+    double d02f = sqrt( pow( (predicted(0) - uavinfo_2_f.x), 2 )
+                       + pow( (predicted(1) - uavinfo_2_f.y), 2 )
+                       + pow( (predicted(2) - uavinfo_2_f.z), 2 ) );
+
+    ofstream ds("/home/patrick/d_0.txt", ios::app);
+    ds<<d01<<endl;
+    ds<<d02<<endl;
+    ds<<d01f<<endl;
+    ds<<d02f<<endl;
+    ds<<endl;
+    ds.close();
+    if(d01 < r_clear || d02 < r_clear || d01f < r_clear || d02f < r_clear)
+    {
+        if(r_safe > uavinfo.z)
+            r_safe = uavinfo.z * 0.5;
+        else
+            r_safe = 1.2 * 0.55;
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+Eigen::Vector3d getmidpt(geometry_msgs::PoseStamped future_state)
+{
+    Eigen::Matrix<double, 3, 1> temp;
+    temp(0) = abs(sqrt(pow(future_state.pose.position.x - uavinfo.x,2)
+                       + pow(future_state.pose.position.y - uavinfo.y,2)
+                       + pow(future_state.pose.position.z - uavinfo.z,2))
+                  );
+//    temp(0) = r_safe;
+    temp(1) = 0;
+    temp(2) = -r_safe;
+    cout<<"uav0"<<temp<<endl<<endl;;
+
+    waypts mdpt = b2w(temp);
+    Eigen::Vector3d rv;
+    rv(0) = mdpt.x;
+    rv(1) = mdpt.y;
+    rv(2) = mdpt.z;
+
+    return rv;
+}
+
+void am_traj_exc(vector<Eigen::Vector3d> detour)//detour will contain current state, the detour waypoint, and the goal state
+{
+
+    //am_traj instantiation
+    Eigen::Vector3d v0(vx,vy,vz), vf(0,0,0);
+    Eigen::Vector3d a0(0,0,0), af(0,0,0);
+//    cout<<"velocity"<<endl<<vx<<endl<<vy<<endl<<vz<<endl<<endl;;
+
+//    cout<<"hey, I'm agent 0, and my velocity (when optimization) is:"<<endl<<v0<<endl;
+//    cout<<"hey, I'm agent 0, and my accelera (when optimization) is:"<<endl<<a0<<endl;
+
+    traj_p.clear();
+    traj_v.clear();
+    traj_a.clear();
+
+    vector<Eigen::Vector3d> wps;
+    for(auto wp : detour)
+    {
+        wps.emplace_back(wp);
+    }
+//    wps.emplace_back(uavinfo.x, uavinfo.y, uavinfo.z);
+//    //wps.emplace_back(detour.x, detour.y, detour.z);
+//    wps.emplace_back(gx,gy,gz);
+
+    AmTraj amTrajOpt(1024.0, 32.0, 1.0, 0.5, 0.5, 32, 0.02);//wT, wA, wJ, maxV, maxA, maxIterations, eps(relative tolerance)
+    Trajectory traj = amTrajOpt.genOptimalTrajDTC(wps,v0,a0,vf,af);
+    double T = 0.05;
+    waypts temp;
+    Eigen::Vector3d lastX = traj.getPos(0.0);
+    Eigen::Vector3d lastV = traj.getVel(0.0);
+    Eigen::Vector3d lastA = traj.getAcc(0.0);
+
+
+//    cout<<"hi, duration"<<endl;
+//    cout<<traj.getTotalDuration()<<endl;
+    for(double t = 0.05; t < traj.getTotalDuration(); t+=T)
+    {
+        geometry_msgs::Point point_p, point_v, point_a;
+        Eigen::Vector3d X = traj.getPos(t);
+        Eigen::Vector3d V = traj.getVel(t);
+        Eigen::Vector3d A = traj.getAcc(t);
+
+        point_p.x = lastX(0);
+        point_p.y = lastX(1);
+        point_p.z = lastX(2);
+        temp.x = point_p.x;
+        temp.y = point_p.y;
+        temp.z = point_p.z;
+        traj_p.push_back(temp);
+        lastX = X;
+
+        point_v.x = lastV(0);
+        point_v.y = lastV(1);
+        point_v.z = lastV(2);
+        temp.x = point_v.x;
+        temp.y = point_v.y;
+        temp.z = point_v.z;
+        traj_v.push_back(temp);
+        lastV = V;
+
+        point_a.x = lastA(0);
+        point_a.x = lastA(1);
+        point_a.x = lastA(2);
+        temp.x = point_a.x;
+        temp.y = point_a.y;
+        temp.z = point_a.z;
+        traj_a.push_back(temp);
+        lastA = A;
+
+//        edge_points.points.push_back(point);
+//        point.x = X(0);
+//        point.y = X(1);
+//        point.z = X(2);
+//        edge_points.points.push_back(point);
+    }
+//    cout<<"optimized result:"<<trajectory.size()<<endl;
+}
+
+
